@@ -51,7 +51,7 @@ class Connection(metaclass=ConnectionMeta):
                  '_intro_query', '_reset_query', '_proxy',
                  '_stmt_exclusive_section', '_config', '_params', '_addr',
                  '_log_listeners', '_termination_listeners', '_cancellations',
-                 '_source_traceback', '__weakref__')
+                 '_source_traceback', '__weakref__', 'project_id')
 
     def __init__(self, protocol, transport, loop,
                  addr,
@@ -62,6 +62,7 @@ class Connection(metaclass=ConnectionMeta):
         self._loop = loop
         self._top_xact = None
         self._aborted = False
+        self.project_id = None
         # Incremented every time the connection is released back to a pool.
         # Used to catch invalid references to connection-related resources
         # post-release (e.g. explicit prepared statements).
