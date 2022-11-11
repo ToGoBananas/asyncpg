@@ -1524,6 +1524,7 @@ class Connection(metaclass=ConnectionMeta):
         return con_ref
 
     def _get_reset_query(self):
+        return
         if self._reset_query is not None:
             return self._reset_query
 
