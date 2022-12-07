@@ -1417,6 +1417,7 @@ class Connection(metaclass=ConnectionMeta):
     def _maybe_gc_stmt(self, stmt):
         if (
             stmt.refs == 0
+            and stmt.name
             and not self._stmt_cache.has(
                 (stmt.query, stmt.record_class, stmt.ignore_custom_codec)
             )
