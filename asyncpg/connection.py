@@ -1710,14 +1710,7 @@ class Connection(metaclass=ConnectionMeta):
         ignore_custom_codec=False,
         record_class=None
     ):
-        executor = lambda stmt, timeout: self._protocol.bind_execute(
-            state=stmt,
-            args=args,
-            portal_name='',
-            limit=limit,
-            return_extra=return_status,
-            timeout=timeout,
-        )
+        executor = lambda stmt, timeout: self._protocol.bind_execute(stmt, args, '', limit, return_status, timeout)
         timeout = self._protocol._get_timeout(timeout)
         return await self._do_execute(
             query,
@@ -1728,12 +1721,7 @@ class Connection(metaclass=ConnectionMeta):
         )
 
     async def _executemany(self, query, args, timeout):
-        executor = lambda stmt, timeout: self._protocol.bind_execute_many(
-            state=stmt,
-            args=args,
-            portal_name='',
-            timeout=timeout,
-        )
+        executor = lambda stmt, timeout: self._protocol.bind_execute_many(stmt, args, '', timeout)
         timeout = self._protocol._get_timeout(timeout)
         with self._stmt_exclusive_section:
             result, _ = await self._do_execute(query, executor, timeout)
