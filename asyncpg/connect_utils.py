@@ -20,7 +20,6 @@ import ssl as ssl_module
 import stat
 import struct
 import sys
-import time
 import typing
 import urllib.parse
 import warnings
@@ -55,9 +54,10 @@ _ConnectionParameters = collections.namedtuple(
         'ssl',
         'sslmode',
         'direct_tls',
-        'connect_timeout',
         'server_settings',
         'target_session_attrs',
+        'krbsrvname',
+        'gsslib',
     ])
 
 
@@ -262,8 +262,8 @@ def _dot_postgresql_path(filename) -> typing.Optional[pathlib.Path]:
 
 def _parse_connect_dsn_and_args(*, dsn, host, port, user,
                                 password, passfile, database, ssl,
-                                direct_tls, connect_timeout, server_settings,
-                                target_session_attrs):
+                                direct_tls, server_settings,
+                                target_session_attrs, krbsrvname, gsslib):
     # `auth_hosts` is the version of host information for the purposes
     # of reading the pgpass file.
     auth_hosts = None
@@ -378,6 +378,23 @@ def _parse_connect_dsn_and_args(*, dsn, host, port, user,
                     'ssl_max_protocol_version'
                 )
 
+            if 'target_session_attrs' in query:
+                dsn_target_session_attrs = query.pop(
+                    'target_session_attrs'
+                )
+                if target_session_attrs is None:
+                    target_session_attrs = dsn_target_session_attrs
+
+            if 'krbsrvname' in query:
+                val = query.pop('krbsrvname')
+                if krbsrvname is None:
+                    krbsrvname = val
+
+            if 'gsslib' in query:
+                val = query.pop('gsslib')
+                if gsslib is None:
+                    gsslib = val
+
             if query:
                 if server_settings is None:
                     server_settings = query
@@ -398,7 +415,7 @@ def _parse_connect_dsn_and_args(*, dsn, host, port, user,
             host = ['/run/postgresql', '/var/run/postgresql',
                     '/tmp', '/private/tmp', 'localhost']
 
-    if not isinstance(host, list):
+    if not isinstance(host, (list, tuple)):
         host = [host]
 
     if auth_hosts is None:
@@ -645,22 +662,35 @@ def _parse_connect_dsn_and_args(*, dsn, host, port, user,
             )
         ) from None
 
+    if krbsrvname is None:
+        krbsrvname = os.getenv('PGKRBSRVNAME')
+
+    if gsslib is None:
+        gsslib = os.getenv('PGGSSLIB')
+        if gsslib is None:
+            gsslib = 'sspi' if _system == 'Windows' else 'gssapi'
+    if gsslib not in {'gssapi', 'sspi'}:
+        raise exceptions.ClientConfigurationError(
+            "gsslib parameter must be either 'gssapi' or 'sspi'"
+            ", got {!r}".format(gsslib))
+
     params = _ConnectionParameters(
         user=user, password=password, database=database, ssl=ssl,
         sslmode=sslmode, direct_tls=direct_tls,
-        connect_timeout=connect_timeout, server_settings=server_settings,
-        target_session_attrs=target_session_attrs)
+        server_settings=server_settings,
+        target_session_attrs=target_session_attrs,
+        krbsrvname=krbsrvname, gsslib=gsslib)
 
     return addrs, params
 
 
 def _parse_connect_arguments(*, dsn, host, port, user, password, passfile,
-                             database, timeout, command_timeout,
+                             database, command_timeout,
                              statement_cache_size,
                              max_cached_statement_lifetime,
                              max_cacheable_statement_size,
                              ssl, direct_tls, server_settings,
-                             target_session_attrs):
+                             target_session_attrs, krbsrvname, gsslib):
     local_vars = locals()
     for var_name in {'max_cacheable_statement_size',
                      'max_cached_statement_lifetime',
@@ -688,8 +718,9 @@ def _parse_connect_arguments(*, dsn, host, port, user, password, passfile,
         dsn=dsn, host=host, port=port, user=user,
         password=password, passfile=passfile, ssl=ssl,
         direct_tls=direct_tls, database=database,
-        connect_timeout=timeout, server_settings=server_settings,
-        target_session_attrs=target_session_attrs)
+        server_settings=server_settings,
+        target_session_attrs=target_session_attrs,
+        krbsrvname=krbsrvname, gsslib=gsslib)
 
     config = _ClientConfiguration(
         command_timeout=command_timeout,
@@ -792,16 +823,12 @@ async def _connect_addr(
     *,
     addr,
     loop,
-    timeout,
     params,
     config,
     connection_class,
     record_class
 ):
     assert loop is not None
-
-    if timeout <= 0:
-        raise asyncio.TimeoutError
 
     params_input = params
     if callable(params.password):
@@ -820,21 +847,16 @@ async def _connect_addr(
         params_retry = params._replace(ssl=None)
     else:
         # skip retry if we don't have to
-        return await __connect_addr(params, timeout, False, *args)
+        return await __connect_addr(params, False, *args)
 
     # first attempt
-    before = time.monotonic()
     try:
-        return await __connect_addr(params, timeout, True, *args)
+        return await __connect_addr(params, True, *args)
     except _RetryConnectSignal:
         pass
 
     # second attempt
-    timeout -= time.monotonic() - before
-    if timeout <= 0:
-        raise asyncio.TimeoutError
-    else:
-        return await __connect_addr(params_retry, timeout, False, *args)
+    return await __connect_addr(params_retry, False, *args)
 
 
 class _RetryConnectSignal(Exception):
@@ -843,7 +865,6 @@ class _RetryConnectSignal(Exception):
 
 async def __connect_addr(
     params,
-    timeout,
     retry,
     addr,
     loop,
@@ -875,15 +896,10 @@ async def __connect_addr(
     else:
         connector = loop.create_connection(proto_factory, *addr)
 
-    connector = asyncio.ensure_future(connector)
-    before = time.monotonic()
-    tr, pr = await compat.wait_for(connector, timeout=timeout)
-    timeout -= time.monotonic() - before
+    tr, pr = await connector
 
     try:
-        if timeout <= 0:
-            raise asyncio.TimeoutError
-        await compat.wait_for(connected, timeout=timeout)
+        await connected
     except (
         exceptions.InvalidAuthorizationSpecificationError,
         exceptions.ConnectionDoesNotExistError,  # seen on Windows
@@ -986,23 +1002,21 @@ async def _can_use_connection(connection, attr: SessionAttribute):
     return await can_use(connection)
 
 
-async def _connect(*, loop, timeout, connection_class, record_class, **kwargs):
+async def _connect(*, loop, connection_class, record_class, **kwargs):
     if loop is None:
         loop = asyncio.get_event_loop()
 
-    addrs, params, config = _parse_connect_arguments(timeout=timeout, **kwargs)
+    addrs, params, config = _parse_connect_arguments(**kwargs)
     target_attr = params.target_session_attrs
 
     candidates = []
     chosen_connection = None
     last_error = None
     for addr in addrs:
-        before = time.monotonic()
         try:
             conn = await _connect_addr(
                 addr=addr,
                 loop=loop,
-                timeout=timeout,
                 params=params,
                 config=config,
                 connection_class=connection_class,
@@ -1012,10 +1026,8 @@ async def _connect(*, loop, timeout, connection_class, record_class, **kwargs):
             if await _can_use_connection(conn, target_attr):
                 chosen_connection = conn
                 break
-        except (OSError, asyncio.TimeoutError, ConnectionError) as ex:
+        except OSError as ex:
             last_error = ex
-        finally:
-            timeout -= time.monotonic() - before
     else:
         if target_attr == SessionAttribute.prefer_standby and candidates:
             chosen_connection = random.choice(candidates)
