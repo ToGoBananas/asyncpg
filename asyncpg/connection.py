@@ -494,24 +494,24 @@ class Connection(metaclass=ConnectionMeta):
         return statement
 
     async def _introspect_types(self, typeoids, timeout):
-        if self._server_caps.jit:
-            try:
-                cfgrow, _ = await self.__execute(
-                    """
-                    SELECT
-                        current_setting('jit') AS cur,
-                        set_config('jit', 'off', false) AS new
-                    """,
-                    (),
-                    0,
-                    timeout,
-                    ignore_custom_codec=True,
-                )
-                jit_state = cfgrow[0]['cur']
-            except exceptions.UndefinedObjectError:
-                jit_state = 'off'
-        else:
-            jit_state = 'off'
+        # if self._server_caps.jit:
+        #     try:
+        #         cfgrow, _ = await self.__execute(
+        #             """
+        #             SELECT
+        #                 current_setting('jit') AS cur,
+        #                 set_config('jit', 'off', false) AS new
+        #             """,
+        #             (),
+        #             0,
+        #             timeout,
+        #             ignore_custom_codec=True,
+        #         )
+        #         jit_state = cfgrow[0]['cur']
+        #     except exceptions.UndefinedObjectError:
+        #         jit_state = 'off'
+        # else:
+        #     jit_state = 'off'
 
         result = await self.__execute(
             self._intro_query,
@@ -521,17 +521,17 @@ class Connection(metaclass=ConnectionMeta):
             ignore_custom_codec=True,
         )
 
-        if jit_state != 'off':
-            await self.__execute(
-                """
-                SELECT
-                    set_config('jit', $1, false)
-                """,
-                (jit_state,),
-                0,
-                timeout,
-                ignore_custom_codec=True,
-            )
+        # if jit_state != 'off':
+        #     await self.__execute(
+        #         """
+        #         SELECT
+        #             set_config('jit', $1, false)
+        #         """,
+        #         (jit_state,),
+        #         0,
+        #         timeout,
+        #         ignore_custom_codec=True,
+        #     )
 
         return result
 
@@ -1660,7 +1660,6 @@ class Connection(metaclass=ConnectionMeta):
         return con_ref
 
     def _get_reset_query(self):
-        return
         if self._reset_query is not None:
             return self._reset_query
 
