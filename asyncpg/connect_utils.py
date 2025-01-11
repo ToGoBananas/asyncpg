@@ -4,9 +4,11 @@
 # This module is part of asyncpg and is released under
 # the Apache 2.0 License: http://www.apache.org/licenses/LICENSE-2.0
 
+from __future__ import annotations
 
 import asyncio
 import collections
+from collections.abc import Callable
 import enum
 import functools
 import getpass
@@ -20,7 +22,6 @@ import ssl as ssl_module
 import stat
 import struct
 import sys
-import time
 import typing
 import urllib.parse
 import warnings
@@ -46,6 +47,11 @@ class SSLMode(enum.IntEnum):
         return getattr(cls, sslmode.replace('-', '_'))
 
 
+class SSLNegotiation(compat.StrEnum):
+    postgres = "postgres"
+    direct = "direct"
+
+
 _ConnectionParameters = collections.namedtuple(
     'ConnectionParameters',
     [
@@ -54,10 +60,11 @@ _ConnectionParameters = collections.namedtuple(
         'database',
         'ssl',
         'sslmode',
-        'direct_tls',
-        'connect_timeout',
+        'ssl_negotiation',
         'server_settings',
         'target_session_attrs',
+        'krbsrvname',
+        'gsslib',
     ])
 
 
@@ -262,13 +269,14 @@ def _dot_postgresql_path(filename) -> typing.Optional[pathlib.Path]:
 
 def _parse_connect_dsn_and_args(*, dsn, host, port, user,
                                 password, passfile, database, ssl,
-                                direct_tls, connect_timeout, server_settings,
-                                target_session_attrs):
+                                direct_tls, server_settings,
+                                target_session_attrs, krbsrvname, gsslib):
     # `auth_hosts` is the version of host information for the purposes
     # of reading the pgpass file.
     auth_hosts = None
     sslcert = sslkey = sslrootcert = sslcrl = sslpassword = None
     ssl_min_protocol_version = ssl_max_protocol_version = None
+    sslnegotiation = None
 
     if dsn:
         parsed = urllib.parse.urlparse(dsn)
@@ -362,6 +370,9 @@ def _parse_connect_dsn_and_args(*, dsn, host, port, user,
             if 'sslrootcert' in query:
                 sslrootcert = query.pop('sslrootcert')
 
+            if 'sslnegotiation' in query:
+                sslnegotiation = query.pop('sslnegotiation')
+
             if 'sslcrl' in query:
                 sslcrl = query.pop('sslcrl')
 
@@ -385,6 +396,16 @@ def _parse_connect_dsn_and_args(*, dsn, host, port, user,
                 if target_session_attrs is None:
                     target_session_attrs = dsn_target_session_attrs
 
+            if 'krbsrvname' in query:
+                val = query.pop('krbsrvname')
+                if krbsrvname is None:
+                    krbsrvname = val
+
+            if 'gsslib' in query:
+                val = query.pop('gsslib')
+                if gsslib is None:
+                    gsslib = val
+
             if query:
                 if server_settings is None:
                     server_settings = query
@@ -405,7 +426,7 @@ def _parse_connect_dsn_and_args(*, dsn, host, port, user,
             host = ['/run/postgresql', '/var/run/postgresql',
                     '/tmp', '/private/tmp', 'localhost']
 
-    if not isinstance(host, list):
+    if not isinstance(host, (list, tuple)):
         host = [host]
 
     if auth_hosts is None:
@@ -493,13 +514,36 @@ def _parse_connect_dsn_and_args(*, dsn, host, port, user,
     if ssl is None and have_tcp_addrs:
         ssl = 'prefer'
 
+    if direct_tls is not None:
+        sslneg = (
+            SSLNegotiation.direct if direct_tls else SSLNegotiation.postgres
+        )
+    else:
+        if sslnegotiation is None:
+            sslnegotiation = os.environ.get("PGSSLNEGOTIATION")
+
+        if sslnegotiation is not None:
+            try:
+                sslneg = SSLNegotiation(sslnegotiation)
+            except ValueError:
+                modes = ', '.join(
+                    m.name.replace('_', '-')
+                    for m in SSLNegotiation
+                )
+                raise exceptions.ClientConfigurationError(
+                    f'`sslnegotiation` parameter must be one of: {modes}'
+                ) from None
+        else:
+            sslneg = SSLNegotiation.postgres
+
     if isinstance(ssl, (str, SSLMode)):
         try:
             sslmode = SSLMode.parse(ssl)
         except AttributeError:
             modes = ', '.join(m.name.replace('_', '-') for m in SSLMode)
             raise exceptions.ClientConfigurationError(
-                '`sslmode` parameter must be one of: {}'.format(modes))
+                '`sslmode` parameter must be one of: {}'.format(modes)
+            ) from None
 
         # docs at https://www.postgresql.org/docs/10/static/libpq-connect.html
         if sslmode < SSLMode.allow:
@@ -652,22 +696,35 @@ def _parse_connect_dsn_and_args(*, dsn, host, port, user,
             )
         ) from None
 
+    if krbsrvname is None:
+        krbsrvname = os.getenv('PGKRBSRVNAME')
+
+    if gsslib is None:
+        gsslib = os.getenv('PGGSSLIB')
+        if gsslib is None:
+            gsslib = 'sspi' if _system == 'Windows' else 'gssapi'
+    if gsslib not in {'gssapi', 'sspi'}:
+        raise exceptions.ClientConfigurationError(
+            "gsslib parameter must be either 'gssapi' or 'sspi'"
+            ", got {!r}".format(gsslib))
+
     params = _ConnectionParameters(
         user=user, password=password, database=database, ssl=ssl,
-        sslmode=sslmode, direct_tls=direct_tls,
-        connect_timeout=connect_timeout, server_settings=server_settings,
-        target_session_attrs=target_session_attrs)
+        sslmode=sslmode, ssl_negotiation=sslneg,
+        server_settings=server_settings,
+        target_session_attrs=target_session_attrs,
+        krbsrvname=krbsrvname, gsslib=gsslib)
 
     return addrs, params
 
 
 def _parse_connect_arguments(*, dsn, host, port, user, password, passfile,
-                             database, timeout, command_timeout,
+                             database, command_timeout,
                              statement_cache_size,
                              max_cached_statement_lifetime,
                              max_cacheable_statement_size,
                              ssl, direct_tls, server_settings,
-                             target_session_attrs):
+                             target_session_attrs, krbsrvname, gsslib):
     local_vars = locals()
     for var_name in {'max_cacheable_statement_size',
                      'max_cached_statement_lifetime',
@@ -695,8 +752,9 @@ def _parse_connect_arguments(*, dsn, host, port, user, password, passfile,
         dsn=dsn, host=host, port=port, user=user,
         password=password, passfile=passfile, ssl=ssl,
         direct_tls=direct_tls, database=database,
-        connect_timeout=timeout, server_settings=server_settings,
-        target_session_attrs=target_session_attrs)
+        server_settings=server_settings,
+        target_session_attrs=target_session_attrs,
+        krbsrvname=krbsrvname, gsslib=gsslib)
 
     config = _ClientConfiguration(
         command_timeout=command_timeout,
@@ -708,14 +766,21 @@ def _parse_connect_arguments(*, dsn, host, port, user, password, passfile,
 
 
 class TLSUpgradeProto(asyncio.Protocol):
-    def __init__(self, loop, host, port, ssl_context, ssl_is_advisory):
+    def __init__(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        host: str,
+        port: int,
+        ssl_context: ssl_module.SSLContext,
+        ssl_is_advisory: bool,
+    ) -> None:
         self.on_data = _create_future(loop)
         self.host = host
         self.port = port
         self.ssl_context = ssl_context
         self.ssl_is_advisory = ssl_is_advisory
 
-    def data_received(self, data):
+    def data_received(self, data: bytes) -> None:
         if data == b'S':
             self.on_data.set_result(True)
         elif (self.ssl_is_advisory and
@@ -733,15 +798,30 @@ class TLSUpgradeProto(asyncio.Protocol):
                     'rejected SSL upgrade'.format(
                         host=self.host, port=self.port)))
 
-    def connection_lost(self, exc):
+    def connection_lost(self, exc: typing.Optional[Exception]) -> None:
         if not self.on_data.done():
             if exc is None:
                 exc = ConnectionError('unexpected connection_lost() call')
             self.on_data.set_exception(exc)
 
 
-async def _create_ssl_connection(protocol_factory, host, port, *,
-                                 loop, ssl_context, ssl_is_advisory=False):
+_ProctolFactoryR = typing.TypeVar(
+    "_ProctolFactoryR", bound=asyncio.protocols.Protocol
+)
+
+
+async def _create_ssl_connection(
+    # TODO: The return type is a specific combination of subclasses of
+    # asyncio.protocols.Protocol that we can't express. For now, having the
+    # return type be dependent on signature of the factory is an improvement
+    protocol_factory: Callable[[], _ProctolFactoryR],
+    host: str,
+    port: int,
+    *,
+    loop: asyncio.AbstractEventLoop,
+    ssl_context: ssl_module.SSLContext,
+    ssl_is_advisory: bool = False,
+) -> typing.Tuple[asyncio.Transport, _ProctolFactoryR]:
 
     tr, pr = await loop.create_connection(
         lambda: TLSUpgradeProto(loop, host, port,
@@ -761,6 +841,7 @@ async def _create_ssl_connection(protocol_factory, host, port, *,
             try:
                 new_tr = await loop.start_tls(
                     tr, pr, ssl_context, server_hostname=host)
+                assert new_tr is not None
             except (Exception, asyncio.CancelledError):
                 tr.close()
                 raise
@@ -799,16 +880,12 @@ async def _connect_addr(
     *,
     addr,
     loop,
-    timeout,
     params,
     config,
     connection_class,
     record_class
 ):
     assert loop is not None
-
-    if timeout <= 0:
-        raise asyncio.TimeoutError
 
     params_input = params
     if callable(params.password):
@@ -827,21 +904,16 @@ async def _connect_addr(
         params_retry = params._replace(ssl=None)
     else:
         # skip retry if we don't have to
-        return await __connect_addr(params, timeout, False, *args)
+        return await __connect_addr(params, False, *args)
 
     # first attempt
-    before = time.monotonic()
     try:
-        return await __connect_addr(params, timeout, True, *args)
+        return await __connect_addr(params, True, *args)
     except _RetryConnectSignal:
         pass
 
     # second attempt
-    timeout -= time.monotonic() - before
-    if timeout <= 0:
-        raise asyncio.TimeoutError
-    else:
-        return await __connect_addr(params_retry, timeout, False, *args)
+    return await __connect_addr(params_retry, False, *args)
 
 
 class _RetryConnectSignal(Exception):
@@ -850,7 +922,6 @@ class _RetryConnectSignal(Exception):
 
 async def __connect_addr(
     params,
-    timeout,
     retry,
     addr,
     loop,
@@ -868,9 +939,9 @@ async def __connect_addr(
         # UNIX socket
         connector = loop.create_unix_connection(proto_factory, addr)
 
-    elif params.ssl and params.direct_tls:
-        # if ssl and direct_tls are given, skip STARTTLS and perform direct
-        # SSL connection
+    elif params.ssl and params.ssl_negotiation is SSLNegotiation.direct:
+        # if ssl and ssl_negotiation is `direct`, skip STARTTLS and perform
+        # direct SSL connection
         connector = loop.create_connection(
             proto_factory, *addr, ssl=params.ssl
         )
@@ -882,15 +953,10 @@ async def __connect_addr(
     else:
         connector = loop.create_connection(proto_factory, *addr)
 
-    connector = asyncio.ensure_future(connector)
-    before = time.monotonic()
-    tr, pr = await compat.wait_for(connector, timeout=timeout)
-    timeout -= time.monotonic() - before
+    tr, pr = await connector
 
     try:
-        if timeout <= 0:
-            raise asyncio.TimeoutError
-        await compat.wait_for(connected, timeout=timeout)
+        await connected
     except (
         exceptions.InvalidAuthorizationSpecificationError,
         exceptions.ConnectionDoesNotExistError,  # seen on Windows
@@ -993,23 +1059,21 @@ async def _can_use_connection(connection, attr: SessionAttribute):
     return await can_use(connection)
 
 
-async def _connect(*, loop, timeout, connection_class, record_class, **kwargs):
+async def _connect(*, loop, connection_class, record_class, **kwargs):
     if loop is None:
         loop = asyncio.get_event_loop()
 
-    addrs, params, config = _parse_connect_arguments(timeout=timeout, **kwargs)
+    addrs, params, config = _parse_connect_arguments(**kwargs)
     target_attr = params.target_session_attrs
 
     candidates = []
     chosen_connection = None
     last_error = None
     for addr in addrs:
-        before = time.monotonic()
         try:
             conn = await _connect_addr(
                 addr=addr,
                 loop=loop,
-                timeout=timeout,
                 params=params,
                 config=config,
                 connection_class=connection_class,
@@ -1019,10 +1083,8 @@ async def _connect(*, loop, timeout, connection_class, record_class, **kwargs):
             if await _can_use_connection(conn, target_attr):
                 chosen_connection = conn
                 break
-        except (OSError, asyncio.TimeoutError, ConnectionError) as ex:
+        except OSError as ex:
             last_error = ex
-        finally:
-            timeout -= time.monotonic() - before
     else:
         if target_attr == SessionAttribute.prefer_standby and candidates:
             chosen_connection = random.choice(candidates)

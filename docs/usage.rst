@@ -44,8 +44,7 @@ which provides methods to run queries and manage transactions.
         # Close the connection.
         await conn.close()
 
-    asyncio.get_event_loop().run_until_complete(main())
-
+    asyncio.run(main())
 
 
 .. note::
@@ -288,7 +287,7 @@ will work.
                 if not hasattr(geometry, '__geo_interface__'):
                     raise TypeError('{g} does not conform to '
                                     'the geo interface'.format(g=geometry))
-                shape = shapely.geometry.asShape(geometry)
+                shape = shapely.geometry.shape(geometry)
                 return shapely.wkb.dumps(shape)
 
             def decode_geometry(wkb):
@@ -344,7 +343,7 @@ shows how to instruct asyncpg to use floats instead.
         finally:
             await conn.close()
 
-    asyncio.get_event_loop().run_until_complete(main())
+    asyncio.run(main())
 
 
 Example: decoding hstore values
@@ -369,7 +368,7 @@ be registered on a connection using :meth:`Connection.set_builtin_type_codec()
         result = await conn.fetchval("SELECT 'a=>1,b=>2,c=>NULL'::hstore")
         assert result == {'a': '1', 'b': '2', 'c': None}
 
-    asyncio.get_event_loop().run_until_complete(run())
+    asyncio.run(run())
 
 .. _hstore: https://www.postgresql.org/docs/current/static/hstore.html
 
@@ -438,20 +437,26 @@ Web service that computes the requested power of two.
                     text="2 ^ {} is {}".format(power, result))
 
 
-    async def init_app():
+    async def init_db(app):
+        """Initialize a connection pool."""
+         app['pool'] = await asyncpg.create_pool(database='postgres',
+                                                 user='postgres')
+         yield
+         await app['pool'].close()
+
+ 
+    def init_app():
         """Initialize the application server."""
         app = web.Application()
-        # Create a database connection pool
-        app['pool'] = await asyncpg.create_pool(database='postgres',
-                                                user='postgres')
+        # Create a database context
+        app.cleanup_ctx.append(init_db)
         # Configure service routes
         app.router.add_route('GET', '/{power:\d+}', handle)
         app.router.add_route('GET', '/', handle)
         return app
 
 
-    loop = asyncio.get_event_loop()
-    app = loop.run_until_complete(init_app())
+    app = init_app()
     web.run_app(app)
 
 See :ref:`asyncpg-api-pool` API documentation for more information.

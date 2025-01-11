@@ -7,11 +7,13 @@
 
 import asyncio
 import contextlib
+import gc
 import ipaddress
 import os
 import pathlib
 import platform
 import shutil
+import socket
 import ssl
 import stat
 import tempfile
@@ -21,6 +23,8 @@ import unittest.mock
 import urllib.parse
 import warnings
 import weakref
+
+import distro
 
 import asyncpg
 from asyncpg import _testbase as tb
@@ -43,6 +47,13 @@ CLIENT_CA_CERT_FILE = os.path.join(CERTS, 'client_ca.cert.pem')
 CLIENT_SSL_CERT_FILE = os.path.join(CERTS, 'client.cert.pem')
 CLIENT_SSL_KEY_FILE = os.path.join(CERTS, 'client.key.pem')
 CLIENT_SSL_PROTECTED_KEY_FILE = os.path.join(CERTS, 'client.key.protected.pem')
+
+if _system == 'Windows':
+    DEFAULT_GSSLIB = 'sspi'
+    OTHER_GSSLIB = 'gssapi'
+else:
+    DEFAULT_GSSLIB = 'gssapi'
+    OTHER_GSSLIB = 'sspi'
 
 
 @contextlib.contextmanager
@@ -129,29 +140,21 @@ class TestSettings(tb.ConnectedTestCase):
 CORRECT_PASSWORD = 'correct\u1680password'
 
 
-class TestAuthentication(tb.ConnectedTestCase):
+class BaseTestAuthentication(tb.ConnectedTestCase):
+    USERS = []
+
     def setUp(self):
         super().setUp()
 
         if not self.cluster.is_managed():
             self.skipTest('unmanaged cluster')
 
-        methods = [
-            ('trust', None),
-            ('reject', None),
-            ('scram-sha-256', CORRECT_PASSWORD),
-            ('md5', CORRECT_PASSWORD),
-            ('password', CORRECT_PASSWORD),
-        ]
-
         self.cluster.reset_hba()
 
         create_script = []
-        for method, password in methods:
+        for username, method, password in self.USERS:
             if method == 'scram-sha-256' and self.server_version.major < 10:
                 continue
-
-            username = method.replace('-', '_')
 
             # if this is a SCRAM password, we need to set the encryption method
             # to "scram-sha-256" in order to properly hash the password
@@ -161,7 +164,7 @@ class TestAuthentication(tb.ConnectedTestCase):
                 )
 
             create_script.append(
-                'CREATE ROLE {}_user WITH LOGIN{};'.format(
+                'CREATE ROLE "{}" WITH LOGIN{};'.format(
                     username,
                     f' PASSWORD E{(password or "")!r}'
                 )
@@ -174,20 +177,20 @@ class TestAuthentication(tb.ConnectedTestCase):
                     "SET password_encryption = 'md5';"
                 )
 
-            if _system != 'Windows':
+            if _system != 'Windows' and method != 'gss':
                 self.cluster.add_hba_entry(
                     type='local',
-                    database='postgres', user='{}_user'.format(username),
+                    database='postgres', user=username,
                     auth_method=method)
 
             self.cluster.add_hba_entry(
                 type='host', address=ipaddress.ip_network('127.0.0.0/24'),
-                database='postgres', user='{}_user'.format(username),
+                database='postgres', user=username,
                 auth_method=method)
 
             self.cluster.add_hba_entry(
                 type='host', address=ipaddress.ip_network('::1/128'),
-                database='postgres', user='{}_user'.format(username),
+                database='postgres', user=username,
                 auth_method=method)
 
         # Put hba changes into effect
@@ -200,27 +203,27 @@ class TestAuthentication(tb.ConnectedTestCase):
         # Reset cluster's pg_hba.conf since we've meddled with it
         self.cluster.trust_local_connections()
 
-        methods = [
-            'trust',
-            'reject',
-            'scram-sha-256',
-            'md5',
-            'password',
-        ]
-
         drop_script = []
-        for method in methods:
+        for username, method, _ in self.USERS:
             if method == 'scram-sha-256' and self.server_version.major < 10:
                 continue
 
-            username = method.replace('-', '_')
-
-            drop_script.append('DROP ROLE {}_user;'.format(username))
+            drop_script.append('DROP ROLE "{}";'.format(username))
 
         drop_script = '\n'.join(drop_script)
         self.loop.run_until_complete(self.con.execute(drop_script))
 
         super().tearDown()
+
+
+class TestAuthentication(BaseTestAuthentication):
+    USERS = [
+        ('trust_user', 'trust', None),
+        ('reject_user', 'reject', None),
+        ('scram_sha_256_user', 'scram-sha-256', CORRECT_PASSWORD),
+        ('md5_user', 'md5', CORRECT_PASSWORD),
+        ('password_user', 'password', CORRECT_PASSWORD),
+    ]
 
     async def _try_connect(self, **kwargs):
         # On Windows the server sometimes just closes
@@ -387,6 +390,92 @@ class TestAuthentication(tb.ConnectedTestCase):
             await self.connect(user='md5_user', password=CORRECT_PASSWORD)
 
 
+@unittest.skipIf(
+    distro.id() == "alpine",
+    "Alpine Linux ships PostgreSQL without GSS auth support",
+)
+class TestGssAuthentication(BaseTestAuthentication):
+    @classmethod
+    def setUpClass(cls):
+        try:
+            from k5test.realm import K5Realm
+        except ModuleNotFoundError:
+            raise unittest.SkipTest('k5test not installed')
+
+        cls.realm = K5Realm()
+        cls.addClassCleanup(cls.realm.stop)
+        # Setup environment before starting the cluster.
+        patch = unittest.mock.patch.dict(os.environ, cls.realm.env)
+        patch.start()
+        cls.addClassCleanup(patch.stop)
+        # Add credentials.
+        cls.realm.addprinc('postgres/localhost')
+        cls.realm.extract_keytab('postgres/localhost', cls.realm.keytab)
+
+        cls.USERS = [
+            (cls.realm.user_princ, 'gss', None),
+            (f'wrong-{cls.realm.user_princ}', 'gss', None),
+        ]
+        super().setUpClass()
+
+        cls.cluster.override_connection_spec(host='localhost')
+
+    @classmethod
+    def get_server_settings(cls):
+        settings = super().get_server_settings()
+        settings['krb_server_keyfile'] = f'FILE:{cls.realm.keytab}'
+        return settings
+
+    @classmethod
+    def setup_cluster(cls):
+        cls.cluster = cls.new_cluster(pg_cluster.TempCluster)
+        cls.start_cluster(
+            cls.cluster, server_settings=cls.get_server_settings())
+
+    async def test_auth_gssapi_ok(self):
+        conn = await self.connect(user=self.realm.user_princ)
+        await conn.close()
+
+    async def test_auth_gssapi_bad_srvname(self):
+        # Service name mismatch.
+        with self.assertRaisesRegex(
+            exceptions.InternalClientError,
+            'Server .* not found'
+        ):
+            await self.connect(user=self.realm.user_princ, krbsrvname='wrong')
+
+    async def test_auth_gssapi_bad_user(self):
+        # Credentials mismatch.
+        with self.assertRaisesRegex(
+            exceptions.InvalidAuthorizationSpecificationError,
+            'GSSAPI authentication failed for user'
+        ):
+            await self.connect(user=f'wrong-{self.realm.user_princ}')
+
+
+@unittest.skipIf(_system != 'Windows', 'SSPI is only available on Windows')
+class TestSspiAuthentication(BaseTestAuthentication):
+    @classmethod
+    def setUpClass(cls):
+        cls.username = f'{os.getlogin()}@{socket.gethostname()}'
+        cls.USERS = [
+            (cls.username, 'sspi', None),
+            (f'wrong-{cls.username}', 'sspi', None),
+        ]
+        super().setUpClass()
+
+    async def test_auth_sspi(self):
+        conn = await self.connect(user=self.username)
+        await conn.close()
+
+        # Credentials mismatch.
+        with self.assertRaisesRegex(
+            exceptions.InvalidAuthorizationSpecificationError,
+            'SSPI authentication failed for user'
+        ):
+            await self.connect(user=f'wrong-{self.username}')
+
+
 class TestConnectParams(tb.TestCase):
 
     TESTS = [
@@ -512,6 +601,58 @@ class TestConnectParams(tb.TestCase):
         },
 
         {
+            'name': 'params_ssl_negotiation_dsn',
+            'env': {
+                'PGSSLNEGOTIATION': 'postgres'
+            },
+
+            'dsn': 'postgres://u:p@localhost/d?sslnegotiation=direct',
+
+            'result': ([('localhost', 5432)], {
+                'user': 'u',
+                'password': 'p',
+                'database': 'd',
+                'ssl_negotiation': 'direct',
+                'target_session_attrs': 'any',
+            })
+        },
+
+        {
+            'name': 'params_ssl_negotiation_env',
+            'env': {
+                'PGSSLNEGOTIATION': 'direct'
+            },
+
+            'dsn': 'postgres://u:p@localhost/d',
+
+            'result': ([('localhost', 5432)], {
+                'user': 'u',
+                'password': 'p',
+                'database': 'd',
+                'ssl_negotiation': 'direct',
+                'target_session_attrs': 'any',
+            })
+        },
+
+        {
+            'name': 'params_ssl_negotiation_params',
+            'env': {
+                'PGSSLNEGOTIATION': 'direct'
+            },
+
+            'dsn': 'postgres://u:p@localhost/d',
+            'direct_tls': False,
+
+            'result': ([('localhost', 5432)], {
+                'user': 'u',
+                'password': 'p',
+                'database': 'd',
+                'ssl_negotiation': 'postgres',
+                'target_session_attrs': 'any',
+            })
+        },
+
+        {
             'name': 'dsn_overrides_env_partially_ssl_prefer',
             'env': {
                 'PGUSER': 'user',
@@ -600,6 +741,112 @@ class TestConnectParams(tb.TestCase):
         },
 
         {
+            'name': 'krbsrvname',
+            'dsn': 'postgresql://user@host/db?krbsrvname=srv_qs',
+            'env': {
+                'PGKRBSRVNAME': 'srv_env',
+            },
+            'result': ([('host', 5432)], {
+                'database': 'db',
+                'user': 'user',
+                'target_session_attrs': 'any',
+                'krbsrvname': 'srv_qs',
+            })
+        },
+
+        {
+            'name': 'krbsrvname_2',
+            'dsn': 'postgresql://user@host/db?krbsrvname=srv_qs',
+            'krbsrvname': 'srv_kws',
+            'env': {
+                'PGKRBSRVNAME': 'srv_env',
+            },
+            'result': ([('host', 5432)], {
+                'database': 'db',
+                'user': 'user',
+                'target_session_attrs': 'any',
+                'krbsrvname': 'srv_kws',
+            })
+        },
+
+        {
+            'name': 'krbsrvname_3',
+            'dsn': 'postgresql://user@host/db',
+            'env': {
+                'PGKRBSRVNAME': 'srv_env',
+            },
+            'result': ([('host', 5432)], {
+                'database': 'db',
+                'user': 'user',
+                'target_session_attrs': 'any',
+                'krbsrvname': 'srv_env',
+            })
+        },
+
+        {
+            'name': 'gsslib',
+            'dsn': f'postgresql://user@host/db?gsslib={OTHER_GSSLIB}',
+            'env': {
+                'PGGSSLIB': 'ignored',
+            },
+            'result': ([('host', 5432)], {
+                'database': 'db',
+                'user': 'user',
+                'target_session_attrs': 'any',
+                'gsslib': OTHER_GSSLIB,
+            })
+        },
+
+        {
+            'name': 'gsslib_2',
+            'dsn': 'postgresql://user@host/db?gsslib=ignored',
+            'gsslib': OTHER_GSSLIB,
+            'env': {
+                'PGGSSLIB': 'ignored',
+            },
+            'result': ([('host', 5432)], {
+                'database': 'db',
+                'user': 'user',
+                'target_session_attrs': 'any',
+                'gsslib': OTHER_GSSLIB,
+            })
+        },
+
+        {
+            'name': 'gsslib_3',
+            'dsn': 'postgresql://user@host/db',
+            'env': {
+                'PGGSSLIB': OTHER_GSSLIB,
+            },
+            'result': ([('host', 5432)], {
+                'database': 'db',
+                'user': 'user',
+                'target_session_attrs': 'any',
+                'gsslib': OTHER_GSSLIB,
+            })
+        },
+
+        {
+            'name': 'gsslib_4',
+            'dsn': 'postgresql://user@host/db',
+            'result': ([('host', 5432)], {
+                'database': 'db',
+                'user': 'user',
+                'target_session_attrs': 'any',
+                'gsslib': DEFAULT_GSSLIB,
+            })
+        },
+
+        {
+            'name': 'gsslib_5',
+            'dsn': 'postgresql://user@host/db?gsslib=invalid',
+            'error': (
+                exceptions.ClientConfigurationError,
+                "gsslib parameter must be either 'gssapi' or 'sspi'"
+            ),
+        },
+
+        {
             'name': 'dsn_ipv6_multi_host',
             'dsn': 'postgresql://user@[2001:db8::1234%25eth0],[::1]/db',
             'result': ([('2001:db8::1234%eth0', 5432), ('::1', 5432)], {
@@ -664,6 +911,19 @@ class TestConnectParams(tb.TestCase):
             },
             'dsn': 'postgresql:///db',
             'host': ['host1', 'host2'],
+            'result': ([('host1', 5432), ('host2', 5432)], {
+                'database': 'db',
+                'user': 'foo',
+                'target_session_attrs': 'any',
+            })
+        },
+        {
+            'name': 'params_multi_host_dsn_env_mix_tuple',
+            'env': {
+                'PGUSER': 'foo',
+            },
+            'dsn': 'postgresql:///db',
+            'host': ('host1', 'host2'),
             'result': ([('host1', 5432), ('host2', 5432)], {
                 'database': 'db',
                 'user': 'foo',
@@ -867,8 +1127,11 @@ class TestConnectParams(tb.TestCase):
         passfile = testcase.get('passfile')
         database = testcase.get('database')
         sslmode = testcase.get('ssl')
+        direct_tls = testcase.get('direct_tls')
         server_settings = testcase.get('server_settings')
         target_session_attrs = testcase.get('target_session_attrs')
+        krbsrvname = testcase.get('krbsrvname')
+        gsslib = testcase.get('gsslib')
 
         expected = testcase.get('result')
         expected_error = testcase.get('error')
@@ -891,9 +1154,10 @@ class TestConnectParams(tb.TestCase):
             addrs, params = connect_utils._parse_connect_dsn_and_args(
                 dsn=dsn, host=host, port=port, user=user, password=password,
                 passfile=passfile, database=database, ssl=sslmode,
-                direct_tls=False, connect_timeout=None,
+                direct_tls=direct_tls,
                 server_settings=server_settings,
-                target_session_attrs=target_session_attrs)
+                target_session_attrs=target_session_attrs,
+                krbsrvname=krbsrvname, gsslib=gsslib)
 
             params = {
                 k: v for k, v in params._asdict().items()
@@ -915,6 +1179,14 @@ class TestConnectParams(tb.TestCase):
                 # Avoid the hassle of specifying direct_tls
                 # unless explicitly tested for
                 params.pop('direct_tls', False)
+            if 'ssl_negotiation' not in expected[1]:
+                # Avoid the hassle of specifying sslnegotiation
+                # unless explicitly tested for
+                params.pop('ssl_negotiation', False)
+            if 'gsslib' not in expected[1]:
+                # Avoid the hassle of specifying gsslib
+                # unless explicitly tested for
+                params.pop('gsslib', None)
 
             self.assertEqual(expected, result, 'Testcase: {}'.format(testcase))
 
@@ -1846,14 +2118,27 @@ class TestNoSSLConnection(BaseTestSSLConnection):
 class TestConnectionGC(tb.ClusterTestCase):
 
     async def _run_no_explicit_close_test(self):
-        con = await self.connect()
-        await con.fetchval("select 123")
-        proto = con._protocol
-        conref = weakref.ref(con)
-        del con
+        gc_was_enabled = gc.isenabled()
+        gc.disable()
+        try:
+            con = await self.connect()
+            await con.fetchval("select 123")
+            proto = con._protocol
+            conref = weakref.ref(con)
+            del con
 
-        self.assertIsNone(conref())
-        self.assertTrue(proto.is_closed())
+            self.assertIsNone(conref())
+            self.assertTrue(proto.is_closed())
+
+            # tick event loop; asyncio.selector_events._SelectorSocketTransport
+            # needs a chance to close itself and remove its reference to proto
+            await asyncio.sleep(0)
+            protoref = weakref.ref(proto)
+            del proto
+            self.assertIsNone(protoref())
+        finally:
+            if gc_was_enabled:
+                gc.enable()
 
     async def test_no_explicit_close_no_debug(self):
         olddebug = self.loop.get_debug()
