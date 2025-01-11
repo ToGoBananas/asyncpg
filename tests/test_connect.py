@@ -24,6 +24,8 @@ import urllib.parse
 import warnings
 import weakref
 
+import distro
+
 import asyncpg
 from asyncpg import _testbase as tb
 from asyncpg import connection as pg_connection
@@ -388,6 +390,10 @@ class TestAuthentication(BaseTestAuthentication):
             await self.connect(user='md5_user', password=CORRECT_PASSWORD)
 
 
+@unittest.skipIf(
+    distro.id() == "alpine",
+    "Alpine Linux ships PostgreSQL without GSS auth support",
+)
 class TestGssAuthentication(BaseTestAuthentication):
     @classmethod
     def setUpClass(cls):
@@ -426,10 +432,11 @@ class TestGssAuthentication(BaseTestAuthentication):
         cls.start_cluster(
             cls.cluster, server_settings=cls.get_server_settings())
 
-    async def test_auth_gssapi(self):
+    async def test_auth_gssapi_ok(self):
         conn = await self.connect(user=self.realm.user_princ)
         await conn.close()
 
+    async def test_auth_gssapi_bad_srvname(self):
         # Service name mismatch.
         with self.assertRaisesRegex(
             exceptions.InternalClientError,
@@ -437,6 +444,7 @@ class TestGssAuthentication(BaseTestAuthentication):
         ):
             await self.connect(user=self.realm.user_princ, krbsrvname='wrong')
 
+    async def test_auth_gssapi_bad_user(self):
         # Credentials mismatch.
         with self.assertRaisesRegex(
             exceptions.InvalidAuthorizationSpecificationError,
@@ -590,6 +598,58 @@ class TestConnectParams(tb.TestCase):
                 'sslmode': SSLMode.disable,
                 'ssl': False,
                 'target_session_attrs': 'any'})
+        },
+
+        {
+            'name': 'params_ssl_negotiation_dsn',
+            'env': {
+                'PGSSLNEGOTIATION': 'postgres'
+            },
+
+            'dsn': 'postgres://u:p@localhost/d?sslnegotiation=direct',
+
+            'result': ([('localhost', 5432)], {
+                'user': 'u',
+                'password': 'p',
+                'database': 'd',
+                'ssl_negotiation': 'direct',
+                'target_session_attrs': 'any',
+            })
+        },
+
+        {
+            'name': 'params_ssl_negotiation_env',
+            'env': {
+                'PGSSLNEGOTIATION': 'direct'
+            },
+
+            'dsn': 'postgres://u:p@localhost/d',
+
+            'result': ([('localhost', 5432)], {
+                'user': 'u',
+                'password': 'p',
+                'database': 'd',
+                'ssl_negotiation': 'direct',
+                'target_session_attrs': 'any',
+            })
+        },
+
+        {
+            'name': 'params_ssl_negotiation_params',
+            'env': {
+                'PGSSLNEGOTIATION': 'direct'
+            },
+
+            'dsn': 'postgres://u:p@localhost/d',
+            'direct_tls': False,
+
+            'result': ([('localhost', 5432)], {
+                'user': 'u',
+                'password': 'p',
+                'database': 'd',
+                'ssl_negotiation': 'postgres',
+                'target_session_attrs': 'any',
+            })
         },
 
         {
@@ -1067,6 +1127,7 @@ class TestConnectParams(tb.TestCase):
         passfile = testcase.get('passfile')
         database = testcase.get('database')
         sslmode = testcase.get('ssl')
+        direct_tls = testcase.get('direct_tls')
         server_settings = testcase.get('server_settings')
         target_session_attrs = testcase.get('target_session_attrs')
         krbsrvname = testcase.get('krbsrvname')
@@ -1093,7 +1154,7 @@ class TestConnectParams(tb.TestCase):
             addrs, params = connect_utils._parse_connect_dsn_and_args(
                 dsn=dsn, host=host, port=port, user=user, password=password,
                 passfile=passfile, database=database, ssl=sslmode,
-                direct_tls=False,
+                direct_tls=direct_tls,
                 server_settings=server_settings,
                 target_session_attrs=target_session_attrs,
                 krbsrvname=krbsrvname, gsslib=gsslib)
@@ -1118,6 +1179,10 @@ class TestConnectParams(tb.TestCase):
                 # Avoid the hassle of specifying direct_tls
                 # unless explicitly tested for
                 params.pop('direct_tls', False)
+            if 'ssl_negotiation' not in expected[1]:
+                # Avoid the hassle of specifying sslnegotiation
+                # unless explicitly tested for
+                params.pop('ssl_negotiation', False)
             if 'gsslib' not in expected[1]:
                 # Avoid the hassle of specifying gsslib
                 # unless explicitly tested for

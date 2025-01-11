@@ -10,7 +10,7 @@ version_file = os.path.join(os.path.dirname(os.path.dirname(__file__)),
 
 with open(version_file, 'r') as f:
     for line in f:
-        if line.startswith('__version__ ='):
+        if line.startswith('__version__: typing.Final ='):
             _, _, version = line.partition('=')
             version = version.strip(" \n'\"")
             break
@@ -26,7 +26,6 @@ extensions = [
     'sphinx.ext.viewcode',
     'sphinx.ext.githubpages',
     'sphinx.ext.intersphinx',
-    'sphinxcontrib.asyncio',
 ]
 
 add_module_names = False

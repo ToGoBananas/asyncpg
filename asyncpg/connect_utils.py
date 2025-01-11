@@ -4,9 +4,11 @@
 # This module is part of asyncpg and is released under
 # the Apache 2.0 License: http://www.apache.org/licenses/LICENSE-2.0
 
+from __future__ import annotations
 
 import asyncio
 import collections
+from collections.abc import Callable
 import enum
 import functools
 import getpass
@@ -45,6 +47,11 @@ class SSLMode(enum.IntEnum):
         return getattr(cls, sslmode.replace('-', '_'))
 
 
+class SSLNegotiation(compat.StrEnum):
+    postgres = "postgres"
+    direct = "direct"
+
+
 _ConnectionParameters = collections.namedtuple(
     'ConnectionParameters',
     [
@@ -53,7 +60,7 @@ _ConnectionParameters = collections.namedtuple(
         'database',
         'ssl',
         'sslmode',
-        'direct_tls',
+        'ssl_negotiation',
         'server_settings',
         'target_session_attrs',
         'krbsrvname',
@@ -269,6 +276,7 @@ def _parse_connect_dsn_and_args(*, dsn, host, port, user,
     auth_hosts = None
     sslcert = sslkey = sslrootcert = sslcrl = sslpassword = None
     ssl_min_protocol_version = ssl_max_protocol_version = None
+    sslnegotiation = None
 
     if dsn:
         parsed = urllib.parse.urlparse(dsn)
@@ -361,6 +369,9 @@ def _parse_connect_dsn_and_args(*, dsn, host, port, user,
 
             if 'sslrootcert' in query:
                 sslrootcert = query.pop('sslrootcert')
+
+            if 'sslnegotiation' in query:
+                sslnegotiation = query.pop('sslnegotiation')
 
             if 'sslcrl' in query:
                 sslcrl = query.pop('sslcrl')
@@ -503,13 +514,36 @@ def _parse_connect_dsn_and_args(*, dsn, host, port, user,
     if ssl is None and have_tcp_addrs:
         ssl = 'prefer'
 
+    if direct_tls is not None:
+        sslneg = (
+            SSLNegotiation.direct if direct_tls else SSLNegotiation.postgres
+        )
+    else:
+        if sslnegotiation is None:
+            sslnegotiation = os.environ.get("PGSSLNEGOTIATION")
+
+        if sslnegotiation is not None:
+            try:
+                sslneg = SSLNegotiation(sslnegotiation)
+            except ValueError:
+                modes = ', '.join(
+                    m.name.replace('_', '-')
+                    for m in SSLNegotiation
+                )
+                raise exceptions.ClientConfigurationError(
+                    f'`sslnegotiation` parameter must be one of: {modes}'
+                ) from None
+        else:
+            sslneg = SSLNegotiation.postgres
+
     if isinstance(ssl, (str, SSLMode)):
         try:
             sslmode = SSLMode.parse(ssl)
         except AttributeError:
             modes = ', '.join(m.name.replace('_', '-') for m in SSLMode)
             raise exceptions.ClientConfigurationError(
-                '`sslmode` parameter must be one of: {}'.format(modes))
+                '`sslmode` parameter must be one of: {}'.format(modes)
+            ) from None
 
         # docs at https://www.postgresql.org/docs/10/static/libpq-connect.html
         if sslmode < SSLMode.allow:
@@ -676,7 +710,7 @@ def _parse_connect_dsn_and_args(*, dsn, host, port, user,
 
     params = _ConnectionParameters(
         user=user, password=password, database=database, ssl=ssl,
-        sslmode=sslmode, direct_tls=direct_tls,
+        sslmode=sslmode, ssl_negotiation=sslneg,
         server_settings=server_settings,
         target_session_attrs=target_session_attrs,
         krbsrvname=krbsrvname, gsslib=gsslib)
@@ -732,14 +766,21 @@ def _parse_connect_arguments(*, dsn, host, port, user, password, passfile,
 
 
 class TLSUpgradeProto(asyncio.Protocol):
-    def __init__(self, loop, host, port, ssl_context, ssl_is_advisory):
+    def __init__(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        host: str,
+        port: int,
+        ssl_context: ssl_module.SSLContext,
+        ssl_is_advisory: bool,
+    ) -> None:
         self.on_data = _create_future(loop)
         self.host = host
         self.port = port
         self.ssl_context = ssl_context
         self.ssl_is_advisory = ssl_is_advisory
 
-    def data_received(self, data):
+    def data_received(self, data: bytes) -> None:
         if data == b'S':
             self.on_data.set_result(True)
         elif (self.ssl_is_advisory and
@@ -757,15 +798,30 @@ class TLSUpgradeProto(asyncio.Protocol):
                     'rejected SSL upgrade'.format(
                         host=self.host, port=self.port)))
 
-    def connection_lost(self, exc):
+    def connection_lost(self, exc: typing.Optional[Exception]) -> None:
         if not self.on_data.done():
             if exc is None:
                 exc = ConnectionError('unexpected connection_lost() call')
             self.on_data.set_exception(exc)
 
 
-async def _create_ssl_connection(protocol_factory, host, port, *,
-                                 loop, ssl_context, ssl_is_advisory=False):
+_ProctolFactoryR = typing.TypeVar(
+    "_ProctolFactoryR", bound=asyncio.protocols.Protocol
+)
+
+
+async def _create_ssl_connection(
+    # TODO: The return type is a specific combination of subclasses of
+    # asyncio.protocols.Protocol that we can't express. For now, having the
+    # return type be dependent on signature of the factory is an improvement
+    protocol_factory: Callable[[], _ProctolFactoryR],
+    host: str,
+    port: int,
+    *,
+    loop: asyncio.AbstractEventLoop,
+    ssl_context: ssl_module.SSLContext,
+    ssl_is_advisory: bool = False,
+) -> typing.Tuple[asyncio.Transport, _ProctolFactoryR]:
 
     tr, pr = await loop.create_connection(
         lambda: TLSUpgradeProto(loop, host, port,
@@ -785,6 +841,7 @@ async def _create_ssl_connection(protocol_factory, host, port, *,
             try:
                 new_tr = await loop.start_tls(
                     tr, pr, ssl_context, server_hostname=host)
+                assert new_tr is not None
             except (Exception, asyncio.CancelledError):
                 tr.close()
                 raise
@@ -882,9 +939,9 @@ async def __connect_addr(
         # UNIX socket
         connector = loop.create_unix_connection(proto_factory, addr)
 
-    elif params.ssl and params.direct_tls:
-        # if ssl and direct_tls are given, skip STARTTLS and perform direct
-        # SSL connection
+    elif params.ssl and params.ssl_negotiation is SSLNegotiation.direct:
+        # if ssl and ssl_negotiation is `direct`, skip STARTTLS and perform
+        # direct SSL connection
         connector = loop.create_connection(
             proto_factory, *addr, ssl=params.ssl
         )

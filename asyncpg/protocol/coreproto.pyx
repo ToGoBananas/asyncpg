@@ -6,7 +6,6 @@
 
 
 import hashlib
-import socket
 
 
 include "scram.pyx"
@@ -728,8 +727,11 @@ cdef class CoreProtocol:
                 'use asyncpg with Kerberos/GSSAPI/SSPI authentication'
             ) from None
 
+        service_name, host = self._auth_gss_get_service()
         self.gss_ctx = gssapi.SecurityContext(
-            name=gssapi.Name(self._auth_gss_get_spn()), usage='initiate')
+            name=gssapi.Name(
+                f'{service_name}@{host}', gssapi.NameType.hostbased_service),
+            usage='initiate')
 
     cdef _auth_gss_init_sspi(self, bint negotiate):
         try:
@@ -740,22 +742,20 @@ cdef class CoreProtocol:
                 'use asyncpg with Kerberos/GSSAPI/SSPI authentication'
             ) from None
 
+        service_name, host = self._auth_gss_get_service()
         self.gss_ctx = sspilib.ClientSecurityContext(
-            target_name=self._auth_gss_get_spn(),
+            target_name=f'{service_name}/{host}',
             credential=sspilib.UserCredential(
                 protocol='Negotiate' if negotiate else 'Kerberos'))
 
-    cdef _auth_gss_get_spn(self):
+    cdef _auth_gss_get_service(self):
         service_name = self.con_params.krbsrvname or 'postgres'
-        # find the canonical name of the server host
         if isinstance(self.address, str):
             raise apg_exc.InternalClientError(
                 'GSSAPI/SSPI authentication is only supported for TCP/IP '
                 'connections')
 
-        host = self.address[0]
-        host_cname = socket.gethostbyname_ex(host)[0]
-        return f'{service_name}/{host_cname}'
+        return service_name, self.address[0]
 
     cdef _auth_gss_step(self, bytes server_response):
         cdef:
@@ -1020,12 +1020,12 @@ cdef class CoreProtocol:
         self._send_bind_message(portal_name, stmt_name, bind_data, limit)
 
     cdef bint _bind_execute_many(self, str portal_name, str stmt_name,
-                                 object bind_data):
+                                 object bind_data, bint return_rows):
         self._ensure_connected()
         self._set_state(PROTOCOL_BIND_EXECUTE_MANY)
 
-        self.result = None
-        self._discard_data = True
+        self.result = [] if return_rows else None
+        self._discard_data = not return_rows
         self._execute_iter = bind_data
         self._execute_portal_name = portal_name
         self._execute_stmt_name = stmt_name
